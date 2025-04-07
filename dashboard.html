@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Nymph: Training Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>Training Dashboard</h1>
+    <p>Welcome to the dashboard for monitoring the training process.</p>
+
+    <div id="loss-chart" style="width: 100%; height: 400px;" aria-label="Loss chart" role="img"></div>
+    <div id="accuracy-chart" style="width: 100%; height: 400px;" aria-label="Accuracy chart" role="img"></div>
+
+    <div aria-live="polite">
+        <p>Current Epoch: <span id="current-epoch">0</span></p>
+        <p>Current Loss: <span id="current-loss">0.00</span></p>
+        <p>Current Accuracy: <span id="current-accuracy">0.00</span></p>
+    </div>
+
+    <script>
+        // Initialize the loss chart
+        var lossChart = new Chart(document.getElementById('loss-chart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Training Loss',
+                    data: [],
+                    borderColor: 'rgba(75, 192, 192, 1)',
+                    borderWidth: 2,
+                    fill: false
+                }]
+            },
+            options: {
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Epoch'
+                        }
+                    },
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Loss'
+                        }
+                    }
+                }
+            }
+        });
+
+        // Initialize the accuracy chart
+        var accuracyChart = new Chart(document.getElementById('accuracy-chart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Training Accuracy',
+                    data: [],
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 2,
+                    fill: false
+                }]
+            },
+            options: {
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Epoch'
+                        }
+                    },
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Accuracy'
+                        }
+                    }
+                }
+            }
+        });
+
+        // Function to update the charts and textual data
+        function updateCharts(epoch, loss, accuracy) {
+            lossChart.data.labels.push(epoch);
+            lossChart.data.datasets[0].data.push(loss);
+            lossChart.update();
+
+            accuracyChart.data.labels.push(epoch);
+            accuracyChart.data.datasets[0].data.push(accuracy);
+            accuracyChart.update();
+
+            // Update textual data
+            document.getElementById('current-epoch').textContent = epoch;
+            document.getElementById('current-loss').textContent = loss.toFixed(4);
+            document.getElementById('current-accuracy').textContent = accuracy.toFixed(4);
+        }
+
+        // WebSocket connection
+        const socket = new WebSocket('ws://localhost:8765');
+
+        // Event listener for incoming messages
+        socket.onmessage = function (event) {
+            const data = JSON.parse(event.data);
+            updateCharts(data.epoch, data.loss, data.accuracy);
+        };
+
+        // Event listener for socket open
+        socket.onopen = function (event) {
+            console.log('WebSocket connection established.');
+        };
+
+        // Event listener for socket closing
+        socket.onclose = function (event) {
+            console.log('WebSocket connection closed.');
+        };
+
+        // Event listener for socket errors
+        socket.onerror = function (error) {
+            console.error('WebSocket error:', error);
+        };
+    </script>
+</body>
+</html>
