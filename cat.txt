@@ -1,0 +1,1183 @@
+dashboard.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Nymph: Training Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>Training Dashboard</h1>
+    <p>Welcome to the dashboard for monitoring the training process.</p>
+
+    <div id="loss-chart" style="width: 100%; height: 400px;" aria-label="Loss chart" role="img"></div>
+    <div id="accuracy-chart" style="width: 100%; height: 400px;" aria-label="Accuracy chart" role="img"></div>
+
+    <div aria-live="polite">
+        <p>Current Epoch: <span id="current-epoch">0</span></p>
+        <p>Current Loss: <span id="current-loss">0.00</span></p>
+        <p>Current Accuracy: <span id="current-accuracy">0.00</span></p>
+    </div>
+
+    <script>
+        // Initialize the loss chart
+        var lossChart = new Chart(document.getElementById('loss-chart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Training Loss',
+                    data: [],
+                    borderColor: 'rgba(75, 192, 192, 1)',
+                    borderWidth: 2,
+                    fill: false
+                }]
+            },
+            options: {
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Epoch'
+                        }
+                    },
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Loss'
+                        }
+                    }
+                }
+            }
+        });
+
+        // Initialize the accuracy chart
+        var accuracyChart = new Chart(document.getElementById('accuracy-chart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Training Accuracy',
+                    data: [],
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 2,
+                    fill: false
+                }]
+            },
+            options: {
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Epoch'
+                        }
+                    },
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Accuracy'
+                        }
+                    }
+                }
+            }
+        });
+
+        // Function to update the charts and textual data
+        function updateCharts(epoch, loss, accuracy) {
+            lossChart.data.labels.push(epoch);
+            lossChart.data.datasets[0].data.push(loss);
+            lossChart.update();
+
+            accuracyChart.data.labels.push(epoch);
+            accuracyChart.data.datasets[0].data.push(accuracy);
+            accuracyChart.update();
+
+            // Update textual data
+            document.getElementById('current-epoch').textContent = epoch;
+            document.getElementById('current-loss').textContent = loss.toFixed(4);
+            document.getElementById('current-accuracy').textContent = accuracy.toFixed(4);
+        }
+
+        // WebSocket connection
+        const socket = new WebSocket('ws://localhost:8765');
+
+        // Event listener for incoming messages
+        socket.onmessage = function (event) {
+            const data = JSON.parse(event.data);
+            updateCharts(data.epoch, data.loss, data.accuracy);
+        };
+
+        // Event listener for socket open
+        socket.onopen = function (event) {
+            console.log('WebSocket connection established.');
+        };
+
+        // Event listener for socket closing
+        socket.onclose = function (event) {
+            console.log('WebSocket connection closed.');
+        };
+
+        // Event listener for socket errors
+        socket.onerror = function (error) {
+            console.error('WebSocket error:', error);
+        };
+    </script>
+</body>
+</html>
+
+main.py
+#!/usr/bin/env python3
+# main.py
+import argparse
+import os
+from training.tokenizer_trainer import train_tokenizer
+from training.transcriber import transcribe_audio
+
+def main():
+    parser = argparse.ArgumentParser(description="Train and use a tokenizer with JSONL input.")
+    parser.add_argument("input_path", help="Path to the audio/text file or directory.")
+    parser.add_argument("output_dir", help="Path to the output directory for JSONL files.")
+    parser.add_argument("--tmp_dir", type=str, default="tmp", help="Path to the temporary directory.")
+    parser.add_argument("--whisper_model", type=str, default="medium", help="Whisper model size (e.g., tiny, base, small, medium, large).")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use (e.g., cuda, cpu).")
+    parser.add_argument("--no_diarize", action="store_false", dest="diarize", help="Disable speaker diarization.")
+    parser.add_argument("--sentiment_model", type=str, default="roberta-base-go_emotions", help="Sentiment analysis model to use (e.g., roberta-base-go_emotions).")
+    parser.add_argument("--sample_rate", type=int, help="Override the audio sample rate.")
+
+    args = parser.parse_args()
+
+    # Transcribe and create JSONL
+    transcribe_audio(
+        args.input_path,
+        args.output_dir,
+        args.tmp_dir,
+        args.whisper_model,
+        args.device,
+        args.diarize,
+        args.sentiment_model,
+        args.sample_rate,
+    )
+
+    # Generate JSONL filename
+    jsonl_filename = os.path.splitext(os.path.basename(args.input_path))[0] + ".jsonl"
+    jsonl_filepath = os.path.join(args.output_dir, jsonl_filename)
+
+    # Train tokenizer
+    train_tokenizer(jsonl_filepath, "tokenizer_config.json")
+
+if __name__ == "__main__":
+    main()
+
+stream.py
+#!/usr/bin/env python3
+
+import pyarrow as pa
+import pyarrow.flight as fl
+import pyarrow.parquet as pq
+import os
+
+class ParquetFlightServer(fl.FlightServerBase):
+    def __init__(self, location, data_dir):
+        super(ParquetFlightServer, self).__init__(location)
+        self.data_dir = data_dir
+
+    def do_get(self, context, ticket):
+        file_list = ticket.ticket.decode().split(",")  # Split filenames from ticket
+        tables = []
+        for filename in file_list:
+            file_path = os.path.join(self.data_dir, filename)
+            try:
+                table = pq.read_table(file_path)
+                tables.append(table)
+            except FileNotFoundError:
+                print(f"File not found: {filename}")
+        if tables:
+            combined_table = pa.concat_tables(tables)
+            return fl.RecordBatchStream(combined_table)
+        else:
+            return fl.RecordBatchStream(pa.Table.from_pandas(pa.pandas_api.empty_table(pa.schema([])))) #return empty table.
+
+def run_flight_server(data_dir, host="0.0.0.0", port=9090):
+    location = fl.Location.for_grpc_tcp(host, port)
+    server = ParquetFlightServer(location, data_dir)
+    server.serve()
+
+if __name__ == "__main__":
+    data_dir = "/models/datasets/" #change path.
+    run_flight_server(data_dir)
+
+tokenizer_config.json
+{
+  "vocab_size": 10000,
+  "special_tokens": [
+    "<unk>",
+    "<pad>",
+    "<bos>",
+    "<eos>",
+    "<system>",
+    "<user>",
+    "<assistant>",
+    "[CONTEXT_PREV_SENT]",
+    "[EMO_ANGER]",
+    "[EMO_SADNESS]",
+    "[EMO_JOY]",
+    "[EMO_LOVE]",
+    "[EMO_FEAR]",
+    "[EMO_SURPRISE]",
+    "[EMO_NEUTRAL]",
+    "[EMO_UNKNOWN]",
+    "[EMO_ADMIRATION]",
+    "[EMO_AMUSEMENT]",
+    "[EMO_ANNOYANCE]",
+    "[EMO_APPROVAL]",
+    "[EMO_CARING]",
+    "[EMO_CONFUSION]",
+    "[EMO_CURIOSITY]",
+    "[EMO_DESIRE]",
+    "[EMO_DISAPPOINTMENT]",
+    "[EMO_DISAPPROVAL]",
+    "[EMO_DISGUST]",
+    "[EMO_EMBARRASSMENT]",
+    "[EMO_EXCITEMENT]",
+    "[EMO_GRATITUDE]",
+    "[EMO_GRIEF]",
+    "[EMO_NERVOUSNESS]",
+    "[EMO_OPTIMISM]",
+    "[EMO_PRIDE]",
+    "[EMO_REALIZATION]",
+    "[EMO_RELIEF]",
+    "[PUNCT_QUESTION]",
+    "[PUNCT_EXCLAMATION]"
+  ],
+  "context_tokens": ["[CONTEXT_PREV_SENT]"],
+  "oov_token": "<unk>",
+  "context_window_size": 3,
+    "emotion_labels": [
+        "admiration",
+        "amusement",
+        "anger",
+        "annoyance",
+        "approval",
+        "caring",
+        "confusion",
+        "curiosity",
+        "desire",
+        "disappointment",
+        "disapproval",
+        "disgust",
+        "embarrassment",
+        "excitement",
+        "fear",
+        "gratitude",
+        "grief",
+        "joy",
+        "love",
+        "nervousness",
+        "optimism",
+        "pride",
+        "realization",
+        "relief",
+        "sadness",
+        "surprise",
+        "neutral"
+    ]
+}
+
+training/model_trainer.py
+#!/usr/bin/env python3
+# model_trainer.py
+
+import json
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import librosa
+import numpy as np
+from tokenizers import Tokenizer
+import argparse
+import os
+import asyncio
+import websockets
+import pyarrow.flight as fl
+import pyarrow as pa
+import io
+
+# Load the tokenizer
+tokenizer = Tokenizer.from_file("tokenizer.json")
+
+# Define a custom dataset using Arrow Flight
+class ArrowFlightDataset(Dataset):
+    def __init__(self, host, port, file_list):
+        self.host = host
+        self.port = port
+        self.file_list = file_list
+        self.table = self.fetch_data()
+        self.data = self.table.to_pandas().to_dict('records') #convert to list of dicts.
+
+    def fetch_data(self):
+        location = fl.Location.for_grpc_tcp(self.host, self.port)
+        client = fl.connect(location)
+        ticket_str = ",".join(self.file_list)
+        ticket = fl.Ticket(ticket_str.encode())
+        reader = client.do_get(ticket)
+        table = reader.read_all()
+        return table
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        audio_filepath = item["audio_filepath"]
+        text = item["text"]
+        speaker = item["speaker"]
+        prosody = item["prosody"]
+        sentiment = item["sentiment"]
+        sample_rate = item["sample_rate"]
+        mfccs = np.array(item["mfccs"])
+        mel_spectrogram = np.array(item["mel_spectrogram"])
+
+        # Load audio features
+        audio, _ = librosa.load(audio_filepath, sr=sample_rate)
+        audio_tensor = torch.tensor(audio, dtype=torch.float32)
+
+        # Tokenize text
+        encoding = tokenizer.encode(text)
+        input_ids = torch.tensor(encoding.ids, dtype=torch.long)
+        attention_mask = torch.tensor(encoding.attention_mask, dtype=torch.long)
+
+        # Convert prosody and sentiment to tensors
+        prosody_tensor = torch.tensor([prosody["pitch"], prosody["energy"], prosody["rate"]], dtype=torch.float32)
+        sentiment_tensor = torch.tensor([sentiment["score"]], dtype=torch.float32)
+
+        # Convert MFCCs and Mel spectrograms to tensors
+        mfccs_tensor = torch.tensor(mfccs, dtype=torch.float32)
+        mel_spectrogram_tensor = torch.tensor(mel_spectrogram, dtype=torch.float32)
+
+        # Convert speaker to integer (assuming speaker labels are in the format SPEAKER_01, SPEAKER_02, ...)
+        speaker_id = int(speaker.split("_")[1])
+
+        return {
+            "audio": audio_tensor,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "prosody": prosody_tensor,
+            "sentiment": sentiment_tensor,
+            "mfccs": mfccs_tensor,
+            "mel_spectrogram": mel_spectrogram_tensor,
+            "speaker": speaker_id
+        }
+
+# Custom Transformer
+class CustomTransformer(nn.Module):
+    def __init__(self, vocab_size, hidden_dim=4096, num_heads=32, num_layers=12, max_seq_length=512):
+        super(CustomTransformer, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.positional_encoding = PositionalEncoding(hidden_dim, max_seq_length)
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(hidden_dim, num_heads, dim_feedforward=hidden_dim * 4)
+            for _ in range(num_layers)
+        ])
+        self.transformer = nn.TransformerEncoder(self.transformer_layers, num_layers)
+
+    def forward(self, input_ids, attention_mask):
+        embedded = self.embedding(input_ids)
+        embedded = self.positional_encoding(embedded)
+        embedded = embedded.transpose(0, 1)  # Transformer expects (seq_len, batch, features)
+        output = self.transformer(embedded, src_key_padding_mask=~attention_mask.bool())
+        output = output.transpose(0, 1)  # Back to (batch, seq_len, features)
+        return output[:, 0, :]  # Return the CLS token equivalent.
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
+
+# Multimodal Model with Custom Transformer
+class MultimodalModel(nn.Module):
+    def __init__(self, num_speakers, vocab_size, latent_dim=1024, window_size=512, hidden_dim=4096, num_heads=32, num_layers=4, transformer_layers = 12, max_seq_length = 512):
+        super(MultimodalModel, self).__init__()
+        self.transformer = CustomTransformer(vocab_size, hidden_dim, num_heads, transformer_layers, max_seq_length) #custom transformer
+        self.audio_linear = nn.Linear(161, hidden_dim)
+        self.prosody_linear = nn.Linear(3, hidden_dim)
+        self.sentiment_linear = nn.Linear(1, hidden_dim)
+        self.speaker_embedding = nn.Embedding(num_speakers, hidden_dim)
+        self.fc = nn.Linear(hidden_dim * 4, hidden_dim)
+
+        # MLA Layers
+        self.key_compression = nn.Linear(hidden_dim, latent_dim)
+        self.value_compression = nn.Linear(hidden_dim, latent_dim)
+        self.attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(latent_dim, num_heads) for _ in range(num_layers)
+        ])
+        self.latent_expansion = nn.Linear(latent_dim, hidden_dim)
+
+        self.window_size = window_size
+
+    def forward(self, audio, input_ids, attention_mask, prosody, sentiment, speaker):
+        bert_output = self.transformer(input_ids, attention_mask) #use custom transformer
+        audio_features = self.audio_linear(audio)
+        audio_features = torch.mean(audio_features, dim=0)
+        prosody_features = self.prosody_linear(prosody)
+        sentiment_features = self.sentiment_linear(sentiment)
+        speaker_features = self.speaker_embedding(speaker)
+
+        keys = self.key_compression(bert_output)
+        values = self.value_compression(bert_output)
+        query = keys
+
+        for attention_layer in self.attention_layers:
+            attn_output, _ = attention_layer(query.transpose(0, 1), keys.transpose(0, 1), values.transpose(0, 1))
+            query = attn_output.transpose(0, 1)
+
+        bert_output = self.latent_expansion(query)
+
+        if self.window_size > 0 and input_ids.size(1) > self.window_size:
+            start = max(0, input_ids.size(1) - self.window_size)
+            bert_output = bert_output[start:]
+
+        combined_features = torch.cat([bert_output, audio_features, prosody_features, sentiment_features, speaker_features], dim=-1)
+        output = self.fc(combined_features)
+        return output
+
+# Function to save the model and optimizer state
+def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir):
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pth")
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+
+# Function to load the model and optimizer state
+def load_checkpoint(checkpoint_path, model, optimizer):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    print(f"Checkpoint loaded from {checkpoint_path} at epoch {epoch} with loss {loss}")
+    return model, optimizer, epoch, loss
+
+async def send_data(websocket, epoch, loss, accuracy):
+    data = {
+        'epoch': epoch,
+        'loss': loss,
+        'accuracy': accuracy
+    }
+    await websocket.send(json.dumps(data))
+
+async def main():
+    parser = argparse.ArgumentParser(description="Train a multimodal LLM/TTS model.")
+    parser.add_argument("--host", type=str, default="your_ryzen_ip", help="Arrow Flight server host.")
+    parser.add_argument("--port", type=int, default=9090, help="Arrow Flight server port.")
+    parser.add_argument("--file_list", nargs='+', default=["dataset1.parquet"], help="List of Parquet files to load.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to the checkpoint directory.")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to the checkpoint file to resume training from.")
+    parser.add_argument("--num_speakers", type=int, default=10, help="Number of speakers in the dataset.")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer.")
+    parser.add_argument("--latent_dim", type=int, default=1024, help="Latent dimension for MLA.")
+    parser.add_argument("--window_size", type=int, default=512, help="Window size for sliding window attention.")
+    parser.add_argument("--hidden_dim", type=int, default=4096, help="Hidden dimension for linear layers.")
+    parser.add_argument("--num_heads", type=int, default=32, help="Number of attention heads.")
+    parser.add_argument("--num_layers", type=int, default=4, help="Number of MLA layers.")
+    parser.add_argument("--transformer_layers", type=int, default=12, help="Number of transformer layers.")
+    parser.add_argument("--max_seq_length", type=int, default=512, help="Max sequence length for transformer.")
+
+    args = parser.parse_args()
+
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Load dataset using Arrow Flight
+    dataset = ArrowFlightDataset(args.host, args.port, args.file_list)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    # Initialize model, optimizer, and loss function
+    vocab_size = tokenizer.get_vocab_size() #get vocab size from tokenizer
+    model = MultimodalModel(args.num_speakers, vocab_size, args.latent_dim, args.window_size, args.hidden_dim, args.num_heads, args.num_layers, args.transformer_layers, args.max_seq_length)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    criterion = nn.MSELoss()  # Using MSELoss for autoencoder approach
+
+    # Load checkpoint if resuming training
+    start_epoch = 0
+    if args.resume_from:
+        model, optimizer, start_epoch, _ = load_checkpoint(args.resume_from, model, optimizer)
+
+    # Training loop
+    async with websockets.serve(lambda websocket, path: training_loop(websocket, path, model, optimizer, criterion, dataloader, args.num_epochs, start_epoch, args.checkpoint_dir), "localhost", 8765):
+        await asyncio.Future()  # run forever
+
+async def training_loop(websocket, path, model, optimizer, criterion, dataloader, num_epochs, start_epoch, checkpoint_dir):
+    for epoch in range(start_epoch, num_epochs):
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        for batch in dataloader:
+            optimizer.zero_grad()
+            audio = batch["audio"]
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            prosody = batch["prosody"]
+            sentiment = batch["sentiment"]
+            speaker = batch["speaker"]
+
+            # Autoencoder target: combined input features
+            bert_output = model.transformer(input_ids, attention_mask)
+            audio_features = model.audio_linear(audio)
+            audio_features = torch.mean(audio_features, dim=0)
+            prosody_features = model.prosody_linear(prosody)
+            sentiment_features = model.sentiment_linear(sentiment)
+            speaker_features = model.speaker_embedding(speaker)
+
+            targets = torch.cat([bert_output, audio_features, prosody_features, sentiment_features, speaker_features], dim=-1)
+
+            outputs = model(audio, input_ids, attention_mask, prosody, sentiment, speaker)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            # Calculate accuracy (replace with your actual accuracy calculation)
+            correct += 0 #Example accuracy calculation
+            total += batch["audio"].size(0)
+
+        avg_loss = total_loss / len(dataloader)
+        accuracy = correct / total if total > 0 else 0
+
+        await send_data(websocket, epoch + 1, avg_loss, accuracy)
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss}, Accuracy: {accuracy}")
+        save_checkpoint(model, optimizer, epoch + 1, avg_loss, checkpoint_dir)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+training/tokenizer_trainer.py
+#!/usr/bin/env python3
+#File: `tokenizer_trainer.py`
+
+import argparse
+import os
+import json
+import nltk
+from typing import List, Dict, Optional, Iterator
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import Whitespace
+from lxml import etree
+
+from nltk.tokenize import sent_tokenize
+from nltk.sentiment import SentimentIntensityAnalyzer
+
+# Ensure nltk is installed and punkt is downloaded
+try:
+    from nltk.tokenize import sent_tokenize
+except ImportError:
+    import nltk
+    nltk.download('punkt')
+    from nltk.tokenize import sent_tokenize
+
+try:
+    from nltk.sentiment import SentimentIntensityAnalyzer
+except ImportError:
+    import nltk
+    nltk.download('vader_lexicon')
+    from nltk.sentiment import SentimentIntensityAnalyzer
+
+import librosa
+import librosa.display
+import numpy as np
+
+def train_tokenizer(
+    jsonl_file: str,  # Changed to accept the jsonl file
+    config_file: str,
+) -> callable:
+    """
+    Trains a tokenizer based on the provided JSONL file and configuration.
+    Uses Hugging Face `tokenizers` library.
+    If audio_dir is provided, it processes audio and adds SSML markup to the text.
+    """
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+
+    vocab_size = config.get("vocab_size", 1000)
+    special_tokens = config.get("special_tokens", ["<unk>", "<pad>", "<bos>", "<eos>"])
+    context_tokens = config.get("context_tokens", ["[CONTEXT_PREV_SENT]"])
+    oov_token = config.get("oov_token", "<unk>")
+    context_window_size = config.get("context_window_size", 3)  # Default context window size
+    emotion_labels = config.get("emotion_labels", [])
+
+    # Initialize the tokenizer
+    tokenizer = Tokenizer(BPE())
+    tokenizer.pre_tokenizer = Whitespace()  # Simple whitespace pre-tokenizer
+
+    # Initialize the trainer
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=special_tokens + context_tokens,
+        show_progress = True
+    )
+
+    # Train the tokenizer
+    def text_generator():
+        with open(jsonl_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    text = data["text"]
+                    clip_name = data["clip_name"]
+                    speaker = data["speaker"]
+                    prosody = data["prosody"]
+                    sentiment = data["sentiment"]
+                    audio_filepath = data["audio_filepath"]
+                    start_time = data["start_time"]
+                    end_time = data["end_time"]
+                    sample_rate = data["sample_rate"]
+                    mfccs = data.get("mfccs") # Get MFCC data
+
+                    # Create emotion/sentiment tokens based on sentiment scores
+                    sentiment_token = ""
+                    if sentiment:
+                        sentiment_label = sentiment.get("label")  # Get sentiment label
+
+                        # Map sentiment labels to tokens, ensuring consistency
+                        if sentiment_label in emotion_labels:
+                            sentiment_token = f"[EMO_{sentiment_label.upper()}]"
+                        else:
+                            sentiment_token = "[EMO_UNKNOWN]"  # Handle unknown labels
+                        # Add speaker token
+                    speaker_token = f"[SPEAKER_{speaker}]"
+
+                    # Create prosody tokens
+                    pitch_token = f"[PITCH_{prosody['pitch']:.2f}]"
+                    energy_token = f"[ENERGY_{prosody['energy']:.2f}]"
+                    rate_token = f"[RATE_{prosody['rate']:.2f}]"
+
+                    # Add Start and End time tokens for audio sync
+                    start_token = f"[START_TIME_{start_time:.2f}]"
+                    end_token = f"[END_TIME_{end_time:.2f}]"
+
+                    #Create tokens for mfccs
+                    mfcc_tokens = []
+                    if mfccs:
+                        # Discretize MFCC values (example with 5 bins)
+                        num_bins = 5
+                        min_mfcc = min(min(mfcc) for mfcc in mfccs)
+                        max_mfcc = max(max(mfcc) for mfcc in mfccs)
+                        bins = np.linspace(min_mfcc, max_mfcc, num_bins + 1)
+
+                        for i, mfcc_values in enumerate(mfccs):
+                            for j, value in enumerate(mfcc_values):
+                                # Find the bin
+                                bin_index = np.digitize(value, bins) - 1  # Bins are 1-indexed
+                                mfcc_tokens.append(f"[MFCC_{i}_{j}_BIN{bin_index}]")  # example: [MFCC_3_4_BIN2]
+
+                    #Combine all tokens with the text
+                    combined_text = f"{sentiment_token} {speaker_token} {pitch_token} {energy_token} {rate_token} {start_token} {end_token} {' '.join(mfcc_tokens)} {text}"
+
+                    yield combined_text
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON: {e}")
+                except KeyError as e:
+                    print(f"Missing key in JSON: {e}")
+
+    tokenizer.train_from_iterator(text_generator(), trainer=trainer)
+
+    # Save the tokenizer
+    tokenizer.save("tokenizer.json")
+    print("Tokenizer saved to tokenizer.json")
+
+    # Context Handling Function
+    def create_context_window(sentences: List[str], index: int, window_size: int) -> str:
+        """Creates a context window around a sentence."""
+        start = max(0, index - window_size)
+        end = min(len(sentences), index + window_size + 1)
+        context = " ".join(sentences[start:index] + sentences[index+1:end]) # Exclude current sentence
+        return context
+
+    def insert_punctuation_tokens(text: str) -> str:
+      """Inserts punctuation tokens based on sentence endings."""
+      if text.endswith("?"):
+          return f"[PUNCT_QUESTION] {text}"
+      elif text.endswith("!"):
+          return f"[PUNCT_EXCLAMATION] {text}"
+      else:
+          return text  # Return original text if no specific punctuation detected
+
+    def tokenize(text: str) -> List[str]:
+        """Tokenizes the input text."""
+        all_tokens = []
+
+        # Split text into sentences
+        sentences = sent_tokenize(text)
+
+        for i, sentence in enumerate(sentences):
+
+            # Insert Punctuation tokens
+            sentence = insert_punctuation_tokens(sentence)
+
+            # Add Context tokens
+            context = create_context_window(sentences, i, context_window_size)
+            sentence_with_context = "[CONTEXT_PREV_SENT] " + context + " " + sentence  # Combine context and sentence
+
+            # Tokenize using the trained tokenizer
+            encoding = tokenizer.encode(sentence_with_context)  # Encode entire string with the sentence and context.
+            tokens = encoding.tokens  # get the tokens out.
+
+            all_tokens.extend(tokens)  # Add to the final list of tokens
+
+        return all_tokens
+
+    return tokenize
+
+training/transcriber.py
+#!/usr/bin/env python3
+#File: `transcriber.py`
+
+import argparse
+import os
+import json
+import librosa
+import librosa.display
+import numpy as np
+import whisperx
+import soundfile as sf
+import torch
+from typing import List, Dict, Tuple, Optional
+from transformers import pipeline  # For transformer sentiment
+import tempfile  # For temporary directories
+import nltk
+
+# MFCC dependencies
+import numpy as np
+import librosa
+
+def extract_mfccs(audio_path: str, sr: int = None, n_mfcc: int = 40) -> np.ndarray:
+    """Extracts MFCC features from the audio file."""
+    y, sr = librosa.load(audio_path, sr=sr)  # Load using the given sample rate. If None librosa will use native SR
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    return mfccs
+
+def extract_mel_spectrogram(audio_path: str, sr: int = None) -> np.ndarray:
+    """Extracts mel spectrogram features from the audio file."""
+    y, sr = librosa.load(audio_path, sr=sr)
+    mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr)
+    return mel_spectrogram
+
+def extract_prosody_features(audio_path: str, sr: int = None) -> Dict[str, float]:  # Added SR
+    """Extracts prosody features (pitch, rate, energy) from the audio file using librosa."""
+    try:
+        y, sr = librosa.load(audio_path, sr=sr)  # Load audio with the given or native sample rate
+
+        # Pitch
+        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+        pitch = np.mean(pitches[magnitudes > 0])
+
+        # Energy (RMS)
+        rms = librosa.feature.rms(y=y)[0]
+        energy = np.mean(rms)
+
+        # Rate (Tempo)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+
+        return {"pitch": pitch, "energy": energy, "rate": tempo}
+
+    except Exception as e:
+        print(f"Error extracting prosody features: {e}")
+        return {"pitch": 0.0, "energy": 0.0, "rate": 0.0}
+
+def analyze_sentiment(text: str, sentiment_pipeline) -> Dict[str, float]:
+    """Analyzes sentiment using a transformer model, handling multiple labels."""
+    try:
+        result = sentiment_pipeline(text, truncation=True, max_length=512)  # Truncate if needed
+
+        # Handle single-label results
+        if isinstance(result, dict) and "label" in result and "score" in result:
+            return {"label": result["label"], "score": result["score"]}
+
+        # Handle multi-label results (if the model returns a list of dicts)
+        elif isinstance(result, list) and all(isinstance(item, dict) and "label" in item and "score" in item for item in result):
+            # Return the label with the highest score
+            best_label = max(result, key=lambda x: x["score"])
+            return {"label": best_label["label"], "score": best_label["score"]}
+
+        else:
+            print(f"Unexpected sentiment analysis result format: {result}")
+            return {"label": "UNKNOWN", "score": 0.0}  # Return a default value in case of error
+
+    except Exception as e:
+        print(f"Error in sentiment analysis: {e}")
+        return {"label": "ERROR", "score": 0.0}  # Return a default value in case of error
+
+def process_audio(audio_path: str, output_dir: str, tmp_dir: str, whisper_model: str, device: str, diarize: bool, sentiment_pipeline, sample_rate: Optional[int]) -> None:
+    """Processes audio files."""
+
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    model = whisperx.load_model(whisper_model, device)
+
+    audio_info = sf.SoundFile(audio_path)
+    native_sr = audio_info.samplerate
+
+    sr = sample_rate if sample_rate is not None else native_sr
+
+    audio = whisperx.load_audio(audio_path, sr=sr)
+
+    result = model.transcribe(audio, batch_size=16)
+
+    model_a, metadata = whisperx.load_align_model(language=result["language"], device=device)
+    result = whisperx.align(result["segments"], audio, model_a, metadata, device, return_char_alignments=False)
+
+    if diarize:
+        diarize_model = whisperx.DiarizationModel(use_auth_token=False, device=device)
+        diarize_segments = diarize_model(audio)
+        result = whisperx.assign_speaker_labels(diarize_segments, result)
+
+    jsonl_filename = os.path.splitext(os.path.basename(audio_path))[0] + ".jsonl"
+    jsonl_filepath = os.path.join(output_dir, jsonl_filename)
+
+    with open(jsonl_filepath, "a", encoding="utf-8") as f:
+        clip_counter = 0
+        for segment in result["segments"]:
+            text = segment["text"].strip()
+            start = segment["start"]
+            end = segment["end"]
+            speaker = segment.get("speaker", "SPEAKER_00")
+            duration = end - start
+
+            sentiment_scores = analyze_sentiment(text, sentiment_pipeline)
+
+            clip_name = f"{os.path.splitext(os.path.basename(audio_path))[0]}-{clip_counter:04d}.wav"
+
+            clip_start_sample = int(start * sr)
+            clip_end_sample = int(end * sr)
+            audio_clip = audio[clip_start_sample:clip_end_sample]
+
+            clip_filepath = os.path.join(tmp_dir, clip_name)
+            sf.write(clip_filepath, audio_clip, sr)
+
+            clip_mfccs = extract_mfccs(clip_filepath, sr=sr)
+            clip_mel_spectrogram = extract_mel_spectrogram(clip_filepath, sr=sr)
+
+            prosody_features = extract_prosody_features(clip_filepath, sr=sr)
+
+            jsonl_entry = {
+                "audio_filepath": clip_filepath,
+                "clip_name": clip_name,
+                "start_time": start,
+                "end_time": end,
+                "text": text,
+                "speaker": speaker,
+                "prosody": prosody_features,
+                "sentiment": sentiment_scores,
+                "sample_rate": sr,
+                "mfccs": clip_mfccs.tolist() if clip_mfccs is not None else None,
+                "mel_spectrogram": clip_mel_spectrogram.tolist() if clip_mel_spectrogram is not None else None,
+            }
+            json.dump(jsonl_entry, f, ensure_ascii=False)
+            f.write("\n")
+            clip_counter += 1
+
+    print(f"Transcription, feature extraction, and JSONL creation complete for: {audio_path}")
+
+def process_text_file(input_path: str, output_dir: str, sentiment_pipeline) -> None:
+    """Processes text files."""
+    jsonl_filename = os.path.splitext(os.path.basename(input_path))[0] + ".jsonl"
+    jsonl_filepath = os.path.join(output_dir, jsonl_filename)
+
+    with open(input_path, "r", encoding="utf-8") as text_file, \
+         open(jsonl_filepath, "a", encoding="utf-8") as jsonl_file:
+
+        text = text_file.read()
+        sentences = nltk.sent_tokenize(text)
+
+        for sentence in sentences:
+            sentiment = analyze_sentiment(sentence, sentiment_pipeline)
+            jsonl_entry = {
+                "text": sentence,
+                "audio_filepath": None,
+                "start_time": None,
+                "end_time": None,
+                "prosody": None,
+                "mfccs": None,
+                "mel_spectrogram": None,
+                "sentiment": sentiment,
+            }
+            json.dump(jsonl_entry, jsonl_file, ensure_ascii=False)
+            jsonl_file.write("\n")
+
+def process_external_jsonl(input_path: str, output_dir: str, sentiment_pipeline) -> None:
+    """Processes external JSONL files."""
+    jsonl_filename = os.path.splitext(os.path.basename(input_path))[0] + "_processed.jsonl"
+    jsonl_filepath = os.path.join(output_dir, jsonl_filename)
+
+    with open(input_path, "r", encoding="utf-8") as in_file, \
+         open(jsonl_filepath, "a", encoding="utf-8") as out_file:
+
+        for line in in_file:
+            try:
+                entry = json.loads(line)
+                if "audio_filepath" in entry or "clip_path" in entry or "audio_clip" in entry :
+                    # process audio data
+                    #TODO add code for processing external jsonl files with audio
+                    print("external jsonl file with audio found. audio processing not implemented yet.")
+                else:
+                    sentiment = analyze_sentiment(entry["text"], sentiment_pipeline)
+                    new_entry = {
+                        "text": entry["text"],
+                        "audio_filepath": None,
+                        "start_time": None,
+                        "end_time": None,
+                        "prosody": None,
+                        "mfccs": None,
+                        "mel_spectrogram": None,
+                        "sentiment": sentiment,
+                    }
+                json.dump(new_entry, out_file, ensure_ascii=False)
+                out_file.write("\n")
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON: {e}")
+
+def transcribe_audio(input_path: str, output_dir: str, tmp_dir: str, whisper_model: str, device: str, diarize: bool, sentiment_model: str, sample_rate: Optional[int]) -> None:
+    """Transcribes audio or text, extracts features, and creates a JSONL file."""
+
+    sentiment_pipeline = pipeline("text-classification", model=sentiment_model, device=device)
+
+    if os.path.isfile(input_path):
+        if input_path.endswith((".wav", ".mp3", ".ogg", ".flac")):
+            process_audio(input_path, output_dir, tmp_dir, whisper_model, device, diarize, sentiment_pipeline, sample_rate)
+        elif input_path.endswith(".txt"):
+            process_text_file(input_path, output_dir, sentiment_pipeline)
+        elif input_path.endswith(".jsonl"):
+            process_external_jsonl(input_path, output_dir, sentiment_pipeline)
+        else:
+            print(f"Unsupported file type: {input_path}")
+    elif os.path.isdir(input_path):
+        for filename in os.listdir(input_path):
+            file_path = os.path.join(input_path, filename)
+            if os.path.isfile(file_path):
+                transcribe_audio(file_path, output_dir, tmp_dir, whisper_model, device, diarize, sentiment_model, sample_rate)
+    else:
+        print(f"Invalid input path: {input_path}")
+
+def main():
+    """Main function to handle command-line arguments."""
+    parser = argparse.ArgumentParser(description="Transcribe audio, extract features, and generate JSONL.")
+    parser.add_argument("input_path", help="Path to the audio/text file or directory.")
+    parser.add_argument("output_dir", help="Path to the output directory for JSONL files.")
+    parser.add_argument("--tmp_dir", type=str, default="tmp", help="Path to the temporary directory.")
+    parser.add_argument("--whisper_model", type=str, default="medium", help="Whisper model size (e.g., tiny, base, small, medium, large).")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use (e.g., cuda, cpu).")
+    parser.add_argument("--no_diarize", action="store_false", dest="diarize", help="Disable speaker diarization.")
+    parser.add_argument("--sentiment_model", type=str, default="roberta-base-go_emotions", help="Sentiment analysis model to use (e.g., roberta-base-go_emotions).")
+    parser.add_argument("--sample_rate", type=int, help="Override the audio sample rate.")
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.tmp_dir, exist_ok=True)
+
+    transcribe_audio(args.input_path, args.output_dir, args.tmp_dir, args.whisper_model, args.device, args.diarize, args.sentiment_model, args.sample_rate)
+
+if __name__ == "__main__":
+    main()
+
+docs/tokenizer.md
+# Tokenizer Design for Enhanced TTS
+
+This document outlines the design and functionality of a novel tokenizer aimed at improving the performance and control of text-to-speech (TTS) systems. The tokenizer integrates multi-level text analysis, sentiment/prosody encoding, and potential audio-text alignment during training.
+
+## Proposed Tokenizer Functionality
+
+1.  **Multi-Level Text Analysis:**
+    * **Sentence-Level Analysis:** The tokenizer identifies sentence boundaries and structural elements (e.g., questions, exclamations) to capture high-level context.
+    * **Word/Phrase Analysis:** The tokenizer recognizes common words, phrases, and sentiment-bearing expressions, encoding them as distinct tokens.
+    * **BPE (Byte-Pair Encoding):** BPE is used for out-of-vocabulary words and subword patterns, ensuring robustness.
+2.  **Contextual Encoding:**
+    * The tokenizer considers surrounding sentences and paragraph-level context to refine tokenization and encode contextual information.
+3.  **Sentiment/Prosody Tokens:**
+    * Special tokens are generated to represent sentiment and prosody features, such as:
+        * **Emotion Tokens:** `[EMO_HAPPY]`, `[EMO_SAD]`, `[EMO_ANGRY]`, `[EMO_NEUTRAL]`, `[EMO_EXCITED]`, `[EMO_CALM]`.
+        * **Prosody Tokens:** `[PROS_HIGH_PITCH]`, `[PROS_LOW_PITCH]`, `[PROS_FAST_SPEED]`, `[PROS_SLOW_SPEED]`, `[PROS_EMPHASIS]`.
+        * **Punctuation/Capitalization Tokens:** `[CAP_ALL]`, `[PUNCT_EXCLAMATION]`, `[PUNCT_QUESTION]`.
+4.  **Audio-Text Alignment (Optional Training):**
+    * If audio data is available during training, the tokenizer attempts to learn acoustic-related patterns.
+    * This might involve:
+        * Extracting acoustic features (e.g., mel-spectrograms) from the audio.
+        * Aligning text tokens with corresponding acoustic features.
+        * Generating tokens that represent acoustic patterns.
+5.  **Output:**
+    * The tokenizer outputs a sequence of tokens that encode text, context, sentiment, and prosody.
+    * These tokens are designed to be directly mapped to mel-spectrograms by a subsequent neural network.
+
+## Training Process
+
+1.  **Data Preparation:**
+    * A mixed dataset of text-only and text-audio data is used.
+    * Text-audio data includes aligned audio clips and transcripts.
+    * Text-only data includes large amounts of text for general language learning.
+2.  **Tokenization Rules:**
+    * Rules are defined for sentence, word/phrase, and BPE tokenization.
+    * Rules are also created to identify sentiment and prosody indicators in the text.
+3.  **Acoustic Feature Extraction (Optional):**
+    * If audio data is available, acoustic features are extracted and aligned with the text.
+4.  **Tokenizer Training:**
+    * The tokenizer is trained to:
+        * Accurately tokenize text based on defined rules.
+        * Generate appropriate sentiment and prosody tokens.
+        * (Optional) Align text tokens with acoustic features.
+5.  **Tokenizer Output:**
+    * The trained tokenizer produces a vocabulary file and tokenization rules.
+
+## Benefits
+
+* **Simplified TTS Neural Network:** The neural network primarily maps tokens to mels, reducing its complexity.
+* **Enhanced Prosody and Sentiment Control:** Special tokens allow for fine-grained control over speech output.
+* **Robustness:** Multi-level tokenization handles text variations effectively.
+* **Potential Efficiency:** Direct token-to-mel mapping can improve inference speed.
+
+## Challenges
+
+* **Tokenizer Training Complexity:** Training the tokenizer to capture acoustic patterns is the main challenge.
+* **Acoustic Feature Extraction and Alignment:** Developing robust methods for these tasks is essential.
+* **Generalization:** Ensuring the tokenizer generalizes to unseen data is critical.
+* **Token Design:** Choosing effective special tokens is crucial.
+
+docs/training.md
+Project Goal:
+We are building a large multimodal language model, that is designed to process audio, text, prosody, sentiment, and speaker information. The model is being designed to operate with a very large context window.
+Key Components:
+1. Model Architecture:
+• We've moved away from using a pre-trained BERT model and are now using a custom-built Transformer architecture (CustomTransformer). This allows us to have complete control over the model's size and configuration.
+• The model incorporates Multi-head Latent Attention (MLA) and Sliding Window Attention (SWA) to efficiently handle very large context windows (256k).
+• The model integrates audio, prosody, sentiment, and speaker embeddings alongside the text input.
+• The model is set up as an autoencoder, where the target is the combined input features.
+2. Dataset Handling:
+• The data is stored in Parquet format for efficient storage and retrieval.
+• We've implemented an Apache Arrow Flight server on a separate machine (Ryzen) to stream the pre-tokenized Parquet data to the training server (Threadripper).
+• The Arrow Flight server can handle multiple Parquet files concurrently, allowing for efficient loading of large datasets.
+• The model_trainer.py script now uses the ArrowFlightDataset class, which is designed to connect to the arrow flight server, and load the data.
+3. Training Setup:
+• The training process is managed by the model_trainer.py script.
+• The script uses PyTorch for model training and optimization.
+• It supports checkpointing to save and resume training progress.
+• It includes a WebSocket server to provide real-time training updates (loss, accuracy).
+4. Hardware Setup:
+• Training Server (Threadripper):
+• 12-core Threadripper CPU.
+• 128GB RAM.
+• Two 24GB P40 GPUs.
+• Six 8GB CMP 104-100 GPUs.
+• Data Serving Server (Ryzen):
+• 6-core Ryzen CPU.
+• 100GB RAM.
+• 8GB 4060 GPU.
+• NVMe drive for data storage.
+• Arrow Flight server to stream data.
+5. Data Flow:
+• The Ryzen machine serves pre-tokenized Parquet data via Arrow Flight.
+• The Threadripper machine receives the data stream, loads it into PyTorch DataLoaders, and trains the model.
+• The model_trainer.py script is designed to take the ip address, and port of the arrow flight server, as well as the list of parquet files to be used.
+Current State:
+• We have a robust data serving pipeline using Arrow Flight.
+• The model architecture is defined and ready for training.
+• The training script is set up to handle data loading, model training, and checkpointing.
+• The project now utilizes the arrow flight server to load the data.
+Next Steps:
+• Begin the training process, monitoring performance and adjusting hyperparameters as needed.
+• Implement evaluation metrics to assess the model's performance.
+• Potentially investigate model parallelism to utilize all available GPUs.
+
+README.md
+Nymph: A system designed to train a multimodal model (for tasks like speech-to-text, text-to-speech, or similar audio-text applications) with a focus on incorporating prosody and sentiment information.  It involves several stages: transcription/data preparation, feature extraction, tokenizer training, and model training, with a dashboard for monitoring progress.
+
+Here's a high-level overview of the key components and how they interact:
+
+**1. Data Preparation and Transcription (`transcriber.py` and `main.py`)**
+
+*   **Input:** The `main.py` script takes an audio/text file or directory as input.
+*   **Transcription (Audio):** If the input is audio, the `transcriber.py` script uses `whisperx` to transcribe the audio into text.
+*   **Feature Extraction:**  Whether the input is audio or text, the `transcriber.py` script extracts relevant features:
+    *   **Audio:**  MFCCs (Mel-Frequency Cepstral Coefficients), Mel spectrograms, and prosodic features (pitch, energy, rate) are extracted using `librosa`. It also splits audio into clips, based on WhisperX's transcription segments
+    *   **Text:** Sentiment analysis is performed using a Hugging Face Transformers pipeline (`roberta-base-go_emotions` by default).
+*   **JSONL Output:**  The extracted features, transcriptions (if applicable), and metadata (start/end times, speaker labels) are stored in a JSONL (JSON Lines) file.  Each line in the JSONL file represents a segment of the audio or a text sentence, along with its associated data.
+
+**2. Tokenizer Training (`tokenizer_trainer.py` and `tokenizer_config.json`)**
+
+*   **Input:** The `tokenizer_trainer.py` script takes the JSONL file generated in the previous step and a configuration file (`tokenizer_config.json`).
+*   **Tokenizer Training:** It trains a Byte Pair Encoding (BPE) tokenizer using the `tokenizers` library from Hugging Face. The tokenizer is trained on the text content of the JSONL file.  The configuration file specifies the vocabulary size, special tokens (like `<unk>`, `<pad>`, `<bos>`, `<eos>`, emotion labels, context tokens), and other tokenizer settings.
+*   **Custom Tokens:** The tokenizer is designed to handle special tokens representing emotions (e.g., `[EMO_ANGER]`), context (e.g., `[CONTEXT_PREV_SENT]`), and other relevant information.  This allows the model to be aware of these contextual aspects during training.
+*   **Context Handling:**  The tokenizer trainer includes logic to create context windows around sentences. This involves extracting surrounding sentences to provide context for the current sentence being tokenized.
+*   **Output:** The trained tokenizer is saved to a file named `tokenizer.json`.
+
+**3. Model Training (`model_trainer.py`)**
+
+*   **Input:** The `model_trainer.py` script uses the JSONL data (presumably converted to parquet format) and the trained tokenizer (`tokenizer.json`).
+*   **Data Loading (Arrow Flight):** The training data (in Parquet format) is loaded using Apache Arrow Flight.  This is a high-performance data transfer protocol that allows for efficient data streaming from a server (`stream.py`).
+*   **Custom Dataset (`ArrowFlightDataset`):**  A custom dataset class (`ArrowFlightDataset`) is defined to handle loading and processing the data from Arrow Flight.  This dataset loads the features (audio, text, prosody, sentiment, speaker) and prepares them for the model.
+*   **Model Architecture (`CustomTransformer` and `MultimodalModel`):**
+    *   `CustomTransformer`: A custom transformer model (based on the standard transformer architecture) is defined for processing the text data.
+    *   `MultimodalModel`: A multimodal model is defined that combines the text features from the transformer with the audio, prosody, and sentiment features.  It uses Multimodal Latent Autoregressive (MLA) layers to fuse the different modalities.
+*   **Training Loop:** The script implements a training loop that iterates over the data, calculates the loss, updates the model's parameters, and periodically saves checkpoints.
+*   **Loss Function:** The code uses MSELoss (Mean Squared Error Loss) - based on the training setup this appears to be autoencoder configuration.
+*   **WebSocket Communication:** The training script uses WebSockets to send training progress updates (epoch, loss, accuracy) to a dashboard (`dashboard.html`).
+*   **Checkpointing:** The model and optimizer states are saved periodically to checkpoint files, allowing training to be resumed from a previous state.
+
+**4. Data Streaming (`stream.py`)**
+
+*   **Arrow Flight Server:** The `stream.py` script implements an Apache Arrow Flight server.  This server is responsible for serving the training data (in Parquet format) to the training script.
+*   **Data Directory:** The server reads Parquet files from a specified data directory.
+
+**5. Dashboard (`dashboard.html`)**
+
+*   **Visualization:**  The `dashboard.html` file provides a simple web-based dashboard to visualize the training progress.
+*   **Real-time Updates:** It uses JavaScript and Chart.js to display the training loss and accuracy in real-time, receiving updates via WebSockets from the training script.
+
+**How it Works (End-to-End):**
+
+1.  **Data Preparation:** An audio file (or text file) is provided to `main.py`.
+2.  **Transcription/Feature Extraction:** `transcriber.py` transcribes the audio (if necessary), extracts features (audio, prosody, sentiment), and creates a JSONL file.
+3.  **Tokenizer Training:** `tokenizer_trainer.py` trains a tokenizer on the JSONL data and saves it as `tokenizer.json`.
+4.  **Data Streaming:** The `stream.py` script starts an Arrow Flight server, making the data accessible over the network.
+5.  **Model Training:** `model_trainer.py` connects to the Arrow Flight server, loads the data, and trains the multimodal model.  It sends training updates to the dashboard via WebSockets.
+6.  **Monitoring:** The `dashboard.html` file displays the training progress in real-time.
+
+**Key Concepts and Technologies:**
+
+*   **Whisperx:**  For audio transcription.
+*   **Librosa:** For audio feature extraction (MFCCs, prosody).
+*   **Hugging Face Transformers:** For sentiment analysis.
+*   **Hugging Face Tokenizers:** For tokenizer training.
+*   **Apache Arrow Flight:**  For high-performance data streaming.
+*   **PyTorch:**  For model definition and training.
+*   **WebSockets:** For real-time communication between the training script and the dashboard.
+*   **JSONL:**  A common format for storing structured data, especially for large datasets.
+*   **Parquet:**  A columnar storage format optimized for analytics.
+
+**Possible Use Cases:**
+
+*   **Speech-to-Text with Emotion Recognition:**  The model could be trained to not only transcribe speech but also identify the speaker's emotional state.
+*   **Text-to-Speech with Expressive Voices:**  The model could be used to generate speech with specific prosodic characteristics and emotional nuances.
+*   **Dialogue Systems:**  The model could be part of a dialogue system that understands and responds to users in a more natural and emotionally aware way.
+
+In summary, this project outlines a comprehensive pipeline for building and training a multimodal model that integrates audio, text, and contextual information. The use of Arrow Flight and WebSockets suggests a focus on scalability and real-time monitoring.
+
+
+
